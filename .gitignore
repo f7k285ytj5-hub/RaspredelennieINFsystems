@@ -1,0 +1,30 @@
+# Visual Studio local settings and caches
+.vs/
+*.user
+*.suo
+*.sln.docstates
+
+# .NET build and publish output
+[Bb]in/
+[Oo]bj/
+[Aa]rtifacts/
+TestResults/
+*.pubxml.user
+
+# Local environment files (keep example templates)
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Private keys and certificates
+*.pfx
+*.p12
+*.key
+
+# Temporary files and logs
+*.log
+*.tmp
+~$*
+Thumbs.db
+.DS_Store

@@ -1,0 +1,333 @@
+Асинхронное чтение изображения
+
+// Фрагмент OpenImageAsync после выбора файла.
+// Чтение файла не блокирует поток интерфейса.
+byte[] bytes = await File.ReadAllBytesAsync(dialog.FileName);
+
+// Декодирование вынесено в штатный пул потоков.
+Bitmap loadedBitmap = await Task.Run(() =>
+{
+    using var stream = new MemoryStream(bytes);
+    using var decoded = new Bitmap(stream);
+    // Копия изображения используется после закрытия потока.
+    return new Bitmap(decoded);
+});
+
+// Освобождаем предыдущие изображения и показываем новое.
+_sourceBitmap?.Dispose();
+_resultBitmap?.Dispose();
+_sourceBitmap = loadedBitmap;
+_resultBitmap = null;
+SetPreview(_sourceBitmap);
+
+Подготовка фрагментов и очереди заданий
+
+// Фрагменты StartProcessingAsync.
+// Число работников берётся из поля «Потоков».
+int workerCount = (int)_workersBox.Value;
+
+// Источник отмены связан с кнопкой «Отмена».
+_processingCts?.Dispose();
+_processingCts = new CancellationTokenSource();
+CancellationToken userToken = _processingCts.Token;
+
+// Замер начинается перед чтением пикселей.
+Stopwatch stopwatch = Stopwatch.StartNew();
+Color[] sourcePixels = await Task.Run(
+    () => ReadPixels(sourceCopy, userToken), userToken);
+
+// При повороте на 90° и 270° размеры меняются местами.
+int outputWidth = angle == 180 ? sourceWidth : sourceHeight;
+int outputHeight = angle == 180 ? sourceHeight : sourceWidth;
+
+// Крайние фрагменты могут иметь размер меньше 64 × 64.
+const int tileSize = 64;
+var tiles = new List<Tile>();
+for (int y = 0; y < sourceHeight; y += tileSize)
+for (int x = 0; x < sourceWidth; x += tileSize)
+{
+    tiles.Add(new Tile(
+        x, y,
+        Math.Min(tileSize, sourceWidth - x),
+        Math.Min(tileSize, sourceHeight - y)));
+}
+
+// Заполненная очередь приостанавливает производителя.
+var channel = Channel.CreateBounded<Tile>(
+    new BoundedChannelOptions(Math.Max(2, workerCount * 2))
+    {
+        FullMode = BoundedChannelFullMode.Wait,
+        SingleWriter = true,
+        SingleReader = false
+    });
+
+Общие данные и механизмы синхронизации
+
+// Фрагмент StartProcessingAsync.
+// Очередь результатов и счётчик защищаются одним lock.
+var syncRoot = new object();
+var completedResults = new Queue<TileResult>();
+int completedTiles = 0;
+
+// Уведомления доставляются в контекст UI-потока.
+IProgress<(int Percent, string Message)> progress =
+    new Progress<(int Percent, string Message)>(value =>
+    {
+        _progress.Value = Math.Clamp(value.Percent, 0, 100);
+        _status.Text = value.Message;
+    });
+
+// Число разрешений равно количеству рабочих задач.
+using var semaphore = new SemaphoreSlim(workerCount, workerCount);
+
+// По одному сигналу на каждый обработанный фрагмент.
+using var allTilesCompleted = new CountdownEvent(tiles.Count);
+
+// Пользовательская отмена передаётся всему конвейеру.
+// При ошибке этапа этот же источник отменяется из catch.
+using var pipelineCts =
+    CancellationTokenSource.CreateLinkedTokenSource(userToken);
+CancellationToken pipelineToken = pipelineCts.Token;
+
+// Обработчик кнопки из конструктора MainForm.
+_cancelButton.Click += (_, _) => _processingCts?.Cancel();
+
+Производитель заданий
+
+// Фрагмент StartProcessingAsync.
+Task producer = Task.Run(async () =>
+{
+    try
+    {
+        foreach (Tile tile in tiles)
+        {
+            pipelineToken.ThrowIfCancellationRequested();
+            // Ожидание места в канале поддерживает отмену.
+            await channel.Writer.WriteAsync(tile, pipelineToken);
+        }
+    }
+    catch
+    {
+        // Ошибка производителя останавливает работников.
+        pipelineCts.Cancel();
+        throw;
+    }
+    finally
+    {
+        // Новых заданий больше не будет.
+        channel.Writer.TryComplete();
+    }
+});
+
+Рабочие задачи и критическая секция
+
+// Фрагмент StartProcessingAsync.
+Task[] workers = Enumerable.Range(0, workerCount)
+    .Select(_ => Task.Run(async () =>
+{
+    try
+    {
+        await foreach (Tile tile in
+            channel.Reader.ReadAllAsync(pipelineToken))
+        {
+            // Разрешение получено до начала обработки.
+            await semaphore.WaitAsync(pipelineToken);
+            try
+            {
+                TileResult result = ProcessTile(
+                    tile, sourcePixels, sourceWidth, sourceHeight,
+                    outputWidth, angle, pipelineToken);
+
+                int done;
+                // Критическая секция защищает общие данные.
+                lock (syncRoot)
+                {
+                    completedResults.Enqueue(result);
+                    done = ++completedTiles;
+                }
+
+                progress.Report((
+                    (int)(done * 100.0 / tiles.Count),
+                    $"Обработка: {done} / {tiles.Count} фрагментов"));
+
+                // Каждый работник сигнализирует о завершении своего фрагмента.
+                allTilesCompleted.Signal();
+            }
+            finally
+            {
+                // Разрешение возвращается и при исключении.
+                semaphore.Release();
+            }
+        }
+    }
+    catch
+    {
+        pipelineCts.Cancel();
+        throw;
+    }
+})).ToArray();
+
+Ожидание завершения и сборка результата
+
+// Фрагмент StartProcessingAsync.
+// Ожидание события выполняется вне потока интерфейса.
+Task allTilesSignalTask = Task.Run(
+    () => allTilesCompleted.Wait(pipelineToken));
+
+// Дожидаемся работников, производителя и ожидания события.
+await Task.WhenAll(
+    workers.Append(producer).Append(allTilesSignalTask));
+
+pipelineToken.ThrowIfCancellationRequested();
+
+// Извлекаем результаты под той же блокировкой.
+TileResult[] results;
+int finalCompletedCount;
+lock (syncRoot)
+{
+    results = completedResults.ToArray();
+    completedResults.Clear();
+    finalCompletedCount = completedTiles;
+}
+
+Color[] outputPixels = new Color[outputWidth * outputHeight];
+foreach (TileResult result in results)
+{
+    foreach (PixelValue pixel in result.Pixels)
+        outputPixels[pixel.Index] = pixel.Color;
+}
+
+Bitmap newResult = await Task.Run(
+    () => CreateBitmap(outputPixels, outputWidth, outputHeight),
+    pipelineToken);
+
+pipelineToken.ThrowIfCancellationRequested();
+
+_resultBitmap?.Dispose();
+_resultBitmap = newResult;
+SetPreview(_resultBitmap);
+
+// В текущем коде время считывается после SetPreview.
+_status.Text =
+    $"Готово! Фрагментов: {finalCompletedCount}. " +
+    $"Время: {stopwatch.Elapsed.TotalMilliseconds:F2} мс";
+
+Обработка отмены и ошибок
+
+// Блоки catch и finally метода StartProcessingAsync.
+catch (OperationCanceledException)
+{
+    // Отменённый или ошибочный результат недоступен.
+    _resultBitmap?.Dispose();
+    _resultBitmap = null;
+    _saveButton.Enabled = false;
+    _progress.Value = 0;
+    _status.Text = "Обработка отменена. Частичный результат не сохранён.";
+}
+catch (Exception ex)
+{
+    // Отменённый или ошибочный результат недоступен.
+    _resultBitmap?.Dispose();
+    _resultBitmap = null;
+    _saveButton.Enabled = false;
+    _status.Text = "Ошибка обработки.";
+    MessageBox.Show(this, $"Ошибка обработки:\n{ex.Message}",
+        "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+}
+finally
+{
+    _processingCts?.Dispose();
+    _processingCts = null;
+    SetBusy(false);
+    _startButton.Enabled = _sourceBitmap is not null;
+    _cancelButton.Enabled = false;
+}
+
+Перестановка пикселей при повороте
+
+private static TileResult ProcessTile(
+    Tile tile, Color[] source, int sourceWidth, int sourceHeight,
+    int outputWidth, int angle, CancellationToken token)
+{
+    var values = new List<PixelValue>(tile.Width * tile.Height);
+
+    for (int y = tile.Y; y < tile.Y + tile.Height; y++)
+    {
+        // Проверяем отмену перед каждой строкой.
+        token.ThrowIfCancellationRequested();
+
+        for (int x = tile.X; x < tile.X + tile.Width; x++)
+        {
+            int dx, dy;
+
+            switch (angle)
+            {
+                // Поворот по часовой стрелке.
+                case 90:
+                    dx = sourceHeight - 1 - y;
+                    dy = x;
+                    break;
+                case 180:
+                    dx = sourceWidth - 1 - x;
+                    dy = sourceHeight - 1 - y;
+                    break;
+                case 270:
+                    dx = y;
+                    dy = sourceWidth - 1 - x;
+                    break;
+                default:
+                    throw new InvalidOperationException(
+                        "Неподдерживаемый угол поворота.");
+            }
+
+            int destinationIndex = dy * outputWidth + dx;
+            values.Add(new PixelValue(
+                destinationIndex, source[y * sourceWidth + x]));
+        }
+    }
+
+    return new TileResult(values.ToArray());
+}
+
+Асинхронное сохранение результата
+
+// Фрагмент SaveResultAsync после выбора пути сохранения.
+// Кодирование изображения выполняется вне UI-потока.
+byte[] pngBytes = await Task.Run(() =>
+{
+    using var memory = new MemoryStream();
+    _resultBitmap.Save(memory, ImageFormat.Png);
+    return memory.ToArray();
+});
+
+string targetPath = dialog.FileName;
+temporaryPath = targetPath + "." +
+    Guid.NewGuid().ToString("N") + ".tmp";
+
+_status.Text = "Асинхронная запись файла...";
+await using (var file = new FileStream(
+    temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+    bufferSize: 81920, options: FileOptions.Asynchronous))
+{
+    await file.WriteAsync(pngBytes);
+    await file.FlushAsync();
+}
+
+// После завершения записи заменяем целевой файл.
+File.Move(temporaryPath, targetPath, overwrite: true);
+temporaryPath = null;
+_status.Text = "Результат сохранён.";
+
+// Фрагмент finally: удаление временного файла при ошибке.
+if (temporaryPath is not null)
+{
+    try
+    {
+        if (File.Exists(temporaryPath))
+            File.Delete(temporaryPath);
+    }
+    catch
+    {
+        // Ошибка очистки не скрывает исходную ошибку записи.
+    }
+}
